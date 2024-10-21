@@ -35,9 +35,6 @@ static constexpr size_t kPlatformTaskRunnerIdentifier = 1;
 static constexpr int32_t kMousePointerDeviceId = 0;
 static constexpr int32_t kPointerPanZoomDeviceId = 1;
 
-// Keeps track of pointer states in relation to the window.
-std::unordered_map<int32_t, std::unique_ptr<PointerState>> pointer_states_;
-
 struct _FlEngine {
   GObject parent_instance;
 
@@ -56,6 +53,9 @@ struct _FlEngine {
 
   // Next ID to use for a view.
   FlutterViewId next_view_id;
+
+  // Keeps track of pointer states in relation to the window.
+  GHashTable* pointer_states;
 
   // Function to call when a platform message is received.
   FlEnginePlatformMessageHandler platform_message_handler;
@@ -433,6 +433,7 @@ static void fl_engine_dispose(GObject* object) {
   g_clear_object(&self->binary_messenger);
   g_clear_object(&self->settings_handler);
   g_clear_object(&self->task_runner);
+  g_clear_pointer(&self->pointer_states, g_hash_table_unref);
 
   if (self->platform_message_handler_destroy_notify) {
     self->platform_message_handler_destroy_notify(
@@ -478,6 +479,9 @@ static void fl_engine_init(FlEngine* self) {
   self->next_view_id = 1;
 
   self->texture_registrar = fl_texture_registrar_new(self);
+
+  self->pointer_states = g_hash_table_new_full(g_direct_hash, g_direct_equal, nullptr,
+                                         g_free);
 }
 
 FlEngine* fl_engine_new_with_renderer(FlDartProject* project,
@@ -907,22 +911,25 @@ void fl_engine_send_mouse_pointer_event(FlEngine* self,
   self->embedder_api.SendPointerEvent(self->engine, &fl_event, 1);
 }
 
-PointerState* GetOrCreatePointerState(FlutterPointerDeviceKind device_kind,
+PointerState* GetOrCreatePointerState(FlEngine* self,
+                                      FlutterPointerDeviceKind device_kind,
                                       int32_t device_id) {
   // Create a virtual pointer ID that is unique across all device types
   // to prevent pointers from clashing in the engine's converter
   // (lib/ui/window/pointer_data_packet_converter.cc)
   int32_t pointer_id = (static_cast<int32_t>(device_kind) << 28) | device_id;
 
-  auto [it, added] = pointer_states_.try_emplace(pointer_id, nullptr);
-  if (added) {
-    auto state = std::make_unique<PointerState>();
-    state->device_kind = device_kind;
-    state->pointer_id = pointer_id;
-    it->second = std::move(state);
-  }
+  // Add the pointer state if it doesn't exist.
+  auto state = g_new(PointerState, 1);
+  state->device_kind = device_kind;
+  state->pointer_id = pointer_id;
 
-  return it->second.get();
+  bool added = g_hash_table_insert(self->pointer_states, GINT_TO_POINTER(pointer_id), state);
+  if (!added) {
+    g_free(state);
+    state = static_cast<PointerState*>(g_hash_table_lookup(self->pointer_states, GINT_TO_POINTER(pointer_id)));
+  }
+  return state;
 }
 
 // Set's |event_data|'s phase to either kMove or kHover depending on the current
@@ -1040,10 +1047,7 @@ void fl_engine_send_pointer_event(FlEngine* self,
   if (event_data.phase == FlutterPointerPhase::kAdd) {
     state->flutter_state_is_added = true;
   } else if (event_data.phase == FlutterPointerPhase::kRemove) {
-    auto it = pointer_states_.find(state->pointer_id);
-    if (it != pointer_states_.end()) {
-      pointer_states_.erase(it);
-    }
+    g_hash_table_remove(self->pointer_states, GINT_TO_POINTER(state->pointer_id));
   }
 }
 
@@ -1055,7 +1059,7 @@ void OnPointerMove(FlEngine* self,
                    int32_t device_id,
                    int modifiers_state) {
   SendPointerMove(self, view_id, x, y,
-                  GetOrCreatePointerState(device_kind, device_id));
+                  GetOrCreatePointerState(self, device_kind, device_id));
 }
 
 void OnPointerDown(FlEngine* self,
@@ -1066,7 +1070,7 @@ void OnPointerDown(FlEngine* self,
                    int32_t device_id,
                    FlutterPointerMouseButtons flutter_button) {
   if (flutter_button != 0) {
-    auto state = GetOrCreatePointerState(device_kind, device_id);
+    auto state = GetOrCreatePointerState(self, device_kind, device_id);
     state->buttons |= flutter_button;
     SendPointerDown(self, view_id, x, y, state);
   }
@@ -1080,7 +1084,7 @@ void OnPointerUp(FlEngine* self,
                  int32_t device_id,
                  FlutterPointerMouseButtons flutter_button) {
   if (flutter_button != 0) {
-    auto state = GetOrCreatePointerState(device_kind, device_id);
+    auto state = GetOrCreatePointerState(self, device_kind, device_id);
     state->buttons &= ~flutter_button;
     SendPointerUp(self, view_id, x, y, state);
   }
@@ -1093,7 +1097,7 @@ void OnPointerLeave(FlEngine* self,
                     FlutterPointerDeviceKind device_kind,
                     int32_t device_id) {
   SendPointerLeave(self, view_id, x, y,
-                   GetOrCreatePointerState(device_kind, device_id));
+                   GetOrCreatePointerState(self, device_kind, device_id));
 }
 
 void fl_engine_send_pointer_pan_zoom_event(FlEngine* self,
